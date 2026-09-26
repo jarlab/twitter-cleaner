@@ -1,11 +1,18 @@
-#!/usr/bin/env node
 // Reads your X "For you" feed, classifies each post with TypeSafe Jev,
 // and clicks "Not interested in this post" on the ones your classifier flags.
-import fs from 'node:fs';
+import path from 'node:path';
 import { parseArgs } from 'node:util';
-import { chromium } from 'playwright';
+import { chromium, type Locator } from 'playwright';
 import { systemOne } from './typesafe.js';
-import { model, questions, shouldHide } from './classifier.js';
+import { loadClassifier, shouldHide } from './classifier.js';
+import { appendDecision } from './log.js';
+
+const ROOT = path.resolve(import.meta.dirname, '../..');
+try {
+  process.loadEnvFile(path.join(ROOT, '.env'));
+} catch {
+  // no .env: rely on the real environment
+}
 
 const { values: args } = parseArgs({
   options: {
@@ -13,7 +20,8 @@ const { values: args } = parseArgs({
     limit: { type: 'string', default: '50' },
     'min-delay': { type: 'string', default: '1500' },
     'max-delay': { type: 'string', default: '4000' },
-    log: { type: 'string', default: 'decisions.jsonl' },
+    classifier: { type: 'string', default: path.join(ROOT, 'classifier.json') },
+    log: { type: 'string', default: path.join(ROOT, 'data/decisions.jsonl') },
     help: { type: 'boolean', short: 'h', default: false },
   },
 });
@@ -24,24 +32,26 @@ if (args.help) {
   --limit N          stop after classifying N posts (default 50)
   --min-delay MS     min pause after each post (default 1500)
   --max-delay MS     max pause after each post (default 4000)
-  --log FILE         where to append decisions (default decisions.jsonl)`);
+  --classifier FILE  classifier config (default ../classifier.json)
+  --log FILE         where to append decisions (default ../data/decisions.jsonl)`);
   process.exit(0);
 }
 
+const dryRun = args['dry-run'];
 const limit = Number(args.limit);
 const minDelay = Number(args['min-delay']);
 const maxDelay = Number(args['max-delay']);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const pause = () => sleep(minDelay + Math.random() * (maxDelay - minDelay));
-const log = (entry) => fs.appendFileSync(args.log, JSON.stringify(entry) + '\n');
 
+const classifier = loadClassifier(args.classifier);
 if (!process.env.TYPESAFE_API_KEY) {
   console.error('TYPESAFE_API_KEY is not set. Copy .env.example to .env and add your key.');
   process.exit(1);
 }
 
 // Persistent profile: you log in once by hand, the session is reused afterwards.
-const context = await chromium.launchPersistentContext('.profile', {
+const context = await chromium.launchPersistentContext(path.join(ROOT, 'bot/.profile'), {
   headless: false,
   viewport: { width: 1200, height: 900 },
 });
@@ -61,16 +71,19 @@ const me = (await page.locator(`${loggedIn} [dir="ltr"] span`).last().innerText(
 await page.getByRole('tab', { name: /for you/i }).click().catch(() => {});
 await page.waitForSelector('article[data-testid="tweet"]');
 
-function readPost(article) {
+type Post = { id: string; author: string; text: string; quoted: string | null };
+
+function readPost(article: Locator): Promise<Post | null> {
   return article.evaluate((el) => {
     const link = [...el.querySelectorAll('a[href*="/status/"]')].find((a) => a.querySelector('time'));
     const m = link?.getAttribute('href')?.match(/^\/([^/]+)\/status\/(\d+)/);
-    const texts = [...el.querySelectorAll('[data-testid="tweetText"]')].map((n) => n.innerText);
-    return { id: m?.[2], author: m?.[1], text: texts[0] ?? '', quoted: texts[1] ?? null };
+    if (!m) return null;
+    const texts = [...el.querySelectorAll<HTMLElement>('[data-testid="tweetText"]')].map((n) => n.innerText);
+    return { id: m[2], author: m[1], text: texts[0] ?? '', quoted: texts[1] ?? null };
   });
 }
 
-async function markNotInterested(article) {
+async function markNotInterested(article: Locator): Promise<boolean> {
   await article.locator('[data-testid="caret"]').first().click();
   const item = page.getByRole('menuitem').filter({ hasText: /not interested/i }).first();
   try {
@@ -83,58 +96,70 @@ async function markNotInterested(article) {
   return true;
 }
 
-const seen = new Set();
+async function nextUnseen(seen: Set<string>): Promise<{ post: Post; article: Locator } | null> {
+  // Re-query each time: the feed re-renders after every click and scroll.
+  for (const article of await page.locator('article[data-testid="tweet"]').all()) {
+    const post = await readPost(article).catch(() => null);
+    if (post && !seen.has(post.id)) return { post, article };
+  }
+  return null;
+}
+
+const seen = new Set<string>();
 let classified = 0;
 let hidden = 0;
 let idleScrolls = 0;
 
 while (classified < limit && idleScrolls < 10) {
-  // Re-query each time: the feed re-renders after every click and scroll.
-  let post = null;
-  let article = null;
-  for (const a of await page.locator('article[data-testid="tweet"]').all()) {
-    const p = await readPost(a).catch(() => null);
-    if (p?.id && !seen.has(p.id)) {
-      post = p;
-      article = a;
-      break;
-    }
-  }
-
-  if (!post) {
+  const next = await nextUnseen(seen);
+  if (!next) {
     idleScrolls++;
     await page.mouse.wheel(0, 1600);
     await sleep(1500);
     continue;
   }
   idleScrolls = 0;
+  const { post, article } = next;
   seen.add(post.id);
 
-  if (post.author?.toLowerCase() === me || !post.text.trim()) continue; // own posts, media-only posts
+  if (post.author.toLowerCase() === me || !post.text.trim()) continue; // own posts, media-only posts
 
-  let answers;
+  let response;
   try {
-    ({ answers } = await systemOne({
-      model,
-      questions,
+    response = await systemOne({
+      model: classifier.model,
+      questions: classifier.questions,
       state: { author: post.author, text: post.text, quoted_post: post.quoted },
-    }));
+    });
   } catch (err) {
-    console.error(`  classify failed for ${post.id}: ${err.message}`);
+    console.error(`  classify failed for ${post.id}: ${(err as Error).message}`);
     continue;
   }
   classified++;
 
-  const hide = shouldHide(answers);
+  const hide = shouldHide(classifier, response.answers);
   let acted = false;
-  if (hide && !args['dry-run']) {
+  if (hide && !dryRun) {
     acted = await markNotInterested(article).catch(() => false);
     if (acted) hidden++;
   }
 
   const snippet = post.text.replace(/\s+/g, ' ').slice(0, 70);
-  console.log(`${hide ? (acted || args['dry-run'] ? 'HIDE' : 'FAIL') : 'keep'}  @${post.author}: ${snippet}`);
-  log({ at: new Date().toISOString(), ...post, answers, hide, acted, dryRun: args['dry-run'] });
+  console.log(`${hide ? (acted || dryRun ? 'HIDE' : 'FAIL') : 'keep'}  @${post.author}: ${snippet}`);
+  appendDecision(args.log, {
+    v: 1,
+    at: new Date().toISOString(),
+    post_id: post.id,
+    author: post.author,
+    text: post.text,
+    quoted: post.quoted,
+    classifier_version: classifier.version,
+    model: response.model,
+    answers: response.answers,
+    hide,
+    acted,
+    dry_run: dryRun,
+  });
 
   await pause();
 }
