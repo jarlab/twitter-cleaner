@@ -2,11 +2,11 @@
   "name": "twitter-cleaner",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node --env-file-if-exists=.env src/index.js",
-    "dry": "node --env-file-if-exists=.env src/index.js --dry-run"
+    "start": "tsx src/index.ts",
+    "dry": "tsx src/index.ts --dry-run",
+    "typecheck": "tsc"
   },
   "keywords": [],
   "author": "",
@@ -14,5 +14,13 @@
   "type": "module",
   "dependencies": {
     "playwright": "^1.63.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
   }
 }

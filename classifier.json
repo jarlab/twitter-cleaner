@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "model": "jev-latest",
+  "questions": {
+    "not_interested": {
+      "type": "noul",
+      "instructions": "This post is something I don't want in my feed: engagement bait, rage bait, low-effort viral filler, giveaway/crypto spam, or drama about people I do not follow.",
+      "criteria": {
+        "true": "Low-value post I would rather not see",
+        "false": "Genuinely informative, thoughtful, funny, or from a conversation I care about"
+      }
+    }
+  },
+  "hide_if": {
+    "any": [{ "question": "not_interested", "field": "noul", "op": ">=", "value": 0.7 }]
+  }
+}
