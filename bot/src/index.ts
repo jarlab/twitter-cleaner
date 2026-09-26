@@ -1,168 +1,193 @@
-// Reads your X "For you" feed, classifies each post with TypeSafe Jev,
-// and clicks "Not interested in this post" on the ones your classifier flags.
+// Reads your X "For you" feed post by post, classifies each post with TypeSafe Jev, and marks the
+// ones your classifier flags as "Not interested". This file is only the CLI and the wiring:
+// the loop is in run.ts, the browser in drivers/, the defaults in config.ts.
 import path from 'node:path';
 import { parseArgs } from 'node:util';
-import { chromium, type Locator } from 'playwright';
-import { systemOne } from './typesafe.js';
 import { loadClassifier, shouldHide } from './classifier.js';
+import { defaultConfig, ROOT, type DriverChoice } from './config.js';
+import { createDriver, DRIVERS } from './drivers/index.js';
+import type { HideMode, LlmConfig } from './drivers/types.js';
+import { checkLlm, describe, LLM_PROVIDERS, parseLlmSpec } from './llm.js';
 import { appendDecision } from './log.js';
+import { run } from './run.js';
+import { systemOne } from './typesafe.js';
 
-const ROOT = path.resolve(import.meta.dirname, '../..');
 try {
   process.loadEnvFile(path.join(ROOT, '.env'));
 } catch {
   // no .env: rely on the real environment
 }
 
-const { values: args } = parseArgs({
-  options: {
-    'dry-run': { type: 'boolean', default: false },
-    limit: { type: 'string', default: '50' },
-    'min-delay': { type: 'string', default: '1500' },
-    'max-delay': { type: 'string', default: '4000' },
-    classifier: { type: 'string', default: path.join(ROOT, 'classifier.json') },
-    log: { type: 'string', default: path.join(ROOT, 'data/decisions.jsonl') },
-    help: { type: 'boolean', short: 'h', default: false },
-  },
-});
+const cfg = defaultConfig();
+const HIDE_MODES: HideMode[] = ['script', 'auto', 'agent'];
+
+// parseArgs throws on unknown flags; show that as a one-line error, not a stack trace.
+function parseCli() {
+  try {
+    return parseArgs({
+      options: {
+        driver: { type: 'string' },
+        hide: { type: 'string' },
+        llm: { type: 'string' },
+        'llm-base-url': { type: 'string' },
+        'dry-run': { type: 'boolean', default: false },
+        rehearse: { type: 'boolean', default: false },
+        limit: { type: 'string', default: String(cfg.run.limit) },
+        'min-delay': { type: 'string', default: String(cfg.run.minDelay) },
+        'max-delay': { type: 'string', default: String(cfg.run.maxDelay) },
+        classifier: { type: 'string', default: path.join(ROOT, 'classifier.json') },
+        log: { type: 'string', default: path.join(ROOT, 'data/decisions.jsonl') },
+        headless: { type: 'boolean', default: false },
+        help: { type: 'boolean', short: 'h', default: false },
+      },
+    }).values;
+  } catch (err) {
+    die(`${(err as Error).message}\nSee --help.`);
+  }
+}
+const args = parseCli();
 
 if (args.help) {
-  console.log(`Usage: npm start -- [options]
-  --dry-run          classify and log, but don't click anything
-  --limit N          stop after classifying N posts (default 50)
-  --min-delay MS     min pause after each post (default 1500)
-  --max-delay MS     max pause after each post (default 4000)
-  --classifier FILE  classifier config (default ../classifier.json)
-  --log FILE         where to append decisions (default ../data/decisions.jsonl)`);
+  console.log(`Usage: npm start -- [options]      (npm run start:bu -- [options] for browser-use)
+  --driver NAME        ${DRIVERS.join(' | ')} (default: $DRIVER or ${cfg.driver})
+  --hide MODE          browser-use only: script (never an LLM) | auto (agent only when the
+                       script breaks) | agent (always) (default ${cfg.browserUse.hide})
+  --llm PROVIDER:MODEL browser-use agent's LLM (default ${describe(cfg.browserUse.llm)}), e.g.
+                       ollama:qwen3:8b, openrouter:meta-llama/llama-3.3-70b-instruct:free,
+                       vercel:openai/gpt-4o-mini, groq:llama-3.3-70b-versatile
+                       providers: ${LLM_PROVIDERS.filter((p) => p !== 'scripted').join(', ')}
+  --llm-base-url URL   server for openai-compatible (LM Studio, vLLM, llama.cpp) or an Ollama host
+  --dry-run            classify and log, but never open a menu (no LLM either)
+  --rehearse           open the menu and find the item, then press Escape instead of clicking
+  --limit N            stop after classifying N posts (default ${cfg.run.limit})
+  --min-delay MS       min time per post, including our own work (default ${cfg.run.minDelay})
+  --max-delay MS       max time per post (default ${cfg.run.maxDelay})
+  --classifier FILE    classifier config (default ../classifier.json)
+  --log FILE           where to append decisions (default ../data/decisions.jsonl)
+  --headless           no browser window (only once you are logged in)
+Ctrl-C once: stop after the current post. Again (a second later or more): close the browser now.`);
   process.exit(0);
 }
 
-const dryRun = args['dry-run'];
-const limit = Number(args.limit);
-const minDelay = Number(args['min-delay']);
-const maxDelay = Number(args['max-delay']);
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const pause = () => sleep(minDelay + Math.random() * (maxDelay - minDelay));
-
-const classifier = loadClassifier(args.classifier);
-if (!process.env.TYPESAFE_API_KEY) {
-  console.error('TYPESAFE_API_KEY is not set. Copy .env.example to .env and add your key.');
+function die(msg: string): never {
+  console.error(msg);
   process.exit(1);
 }
 
-// Persistent profile: you log in once by hand, the session is reused afterwards.
-const context = await chromium.launchPersistentContext(path.join(ROOT, 'bot/.profile'), {
-  headless: false,
-  viewport: { width: 1200, height: 900 },
-});
-const page = context.pages()[0] ?? (await context.newPage());
-
-await page.goto('https://x.com/home');
-const loggedIn = '[data-testid="SideNav_AccountSwitcher_Button"]';
-if (!(await page.locator(loggedIn).isVisible().catch(() => false))) {
-  console.log('Log in to X in the browser window; I will continue once you are on the home feed.');
-  await page.waitForSelector(loggedIn, { timeout: 0 });
-}
-const me = (await page.locator(`${loggedIn} [dir="ltr"] span`).last().innerText().catch(() => ''))
-  .replace(/^@/, '')
-  .toLowerCase();
-
-// "Not interested" only exists on the algorithmic "For you" tab.
-await page.getByRole('tab', { name: /for you/i }).click().catch(() => {});
-await page.waitForSelector('article[data-testid="tweet"]');
-
-type Post = { id: string; author: string; text: string; quoted: string | null };
-
-function readPost(article: Locator): Promise<Post | null> {
-  return article.evaluate((el) => {
-    const link = [...el.querySelectorAll('a[href*="/status/"]')].find((a) => a.querySelector('time'));
-    const m = link?.getAttribute('href')?.match(/^\/([^/]+)\/status\/(\d+)/);
-    if (!m) return null;
-    const texts = [...el.querySelectorAll<HTMLElement>('[data-testid="tweetText"]')].map((n) => n.innerText);
-    return { id: m[2], author: m[1], text: texts[0] ?? '', quoted: texts[1] ?? null };
-  });
+function count(flag: 'limit' | 'min-delay' | 'max-delay'): number {
+  const raw = args[flag]!;
+  if (!/^\d+$/.test(raw)) die(`--${flag} must be a whole number >= 0, got "${raw}"`);
+  return Number(raw);
 }
 
-async function markNotInterested(article: Locator): Promise<boolean> {
-  await article.locator('[data-testid="caret"]').first().click();
-  const item = page.getByRole('menuitem').filter({ hasText: /not interested/i }).first();
+// ---------------------------------------------------------------- options (CLI > env > config.ts)
+
+const driverName = (args.driver ?? process.env.DRIVER ?? cfg.driver) as DriverChoice;
+if (!DRIVERS.includes(driverName)) die(`--driver must be ${DRIVERS.join(' or ')}, got "${driverName}"`);
+
+const dryRun = args['dry-run'];
+const rehearse = args.rehearse;
+if (dryRun && rehearse) die('--dry-run and --rehearse are mutually exclusive');
+
+cfg.run.limit = count('limit');
+cfg.run.minDelay = count('min-delay');
+cfg.run.maxDelay = count('max-delay');
+if (cfg.run.minDelay > cfg.run.maxDelay) die('--min-delay must not be larger than --max-delay');
+
+if (args.headless) cfg.playwright.headless = cfg.browserUse.headless = true;
+
+if (driverName !== 'browser-use' && (args.hide || args.llm || args['llm-base-url'])) {
+  die('--hide, --llm and --llm-base-url only apply to --driver browser-use');
+}
+if (args.hide) {
+  if (!HIDE_MODES.includes(args.hide as HideMode)) die(`--hide must be ${HIDE_MODES.join(', ')}, got "${args.hide}"`);
+  cfg.browserUse.hide = args.hide as HideMode;
+}
+if (dryRun) cfg.browserUse.hide = 'script'; // a dry run never opens a menu, so no LLM is needed
+if (args.llm) {
   try {
-    await item.waitFor({ state: 'visible', timeout: 3000 });
-  } catch {
-    await page.keyboard.press('Escape'); // menu had no such option (e.g. an ad)
-    return false;
-  }
-  await item.click();
-  return true;
-}
-
-async function nextUnseen(seen: Set<string>): Promise<{ post: Post; article: Locator } | null> {
-  // Re-query each time: the feed re-renders after every click and scroll.
-  for (const article of await page.locator('article[data-testid="tweet"]').all()) {
-    const post = await readPost(article).catch(() => null);
-    if (post && !seen.has(post.id)) return { post, article };
-  }
-  return null;
-}
-
-const seen = new Set<string>();
-let classified = 0;
-let hidden = 0;
-let idleScrolls = 0;
-
-while (classified < limit && idleScrolls < 10) {
-  const next = await nextUnseen(seen);
-  if (!next) {
-    idleScrolls++;
-    await page.mouse.wheel(0, 1600);
-    await sleep(1500);
-    continue;
-  }
-  idleScrolls = 0;
-  const { post, article } = next;
-  seen.add(post.id);
-
-  if (post.author.toLowerCase() === me || !post.text.trim()) continue; // own posts, media-only posts
-
-  let response;
-  try {
-    response = await systemOne({
-      model: classifier.model,
-      questions: classifier.questions,
-      state: { author: post.author, text: post.text, quoted_post: post.quoted },
-    });
+    cfg.browserUse.llm = parseLlmSpec(args.llm);
   } catch (err) {
-    console.error(`  classify failed for ${post.id}: ${(err as Error).message}`);
-    continue;
+    die((err as Error).message);
   }
-  classified++;
+}
+if (args['llm-base-url']) cfg.browserUse.llm.baseUrl = args['llm-base-url'];
 
-  const hide = shouldHide(classifier, response.answers);
-  let acted = false;
-  if (hide && !dryRun) {
-    acted = await markNotInterested(article).catch(() => false);
-    if (acted) hidden++;
-  }
+// ---------------------------------------------------------------- checks, before any browser starts
 
-  const snippet = post.text.replace(/\s+/g, ' ').slice(0, 70);
-  console.log(`${hide ? (acted || dryRun ? 'HIDE' : 'FAIL') : 'keep'}  @${post.author}: ${snippet}`);
-  appendDecision(args.log, {
-    v: 1,
-    at: new Date().toISOString(),
-    post_id: post.id,
-    author: post.author,
-    text: post.text,
-    quoted: post.quoted,
-    classifier_version: classifier.version,
-    model: response.model,
-    answers: response.answers,
-    hide,
-    acted,
-    dry_run: dryRun,
-  });
+const classifier = loadClassifier(args.classifier);
+if (!process.env.TYPESAFE_API_KEY) die('TYPESAFE_API_KEY is not set. Copy .env.example to .env and add your key.');
 
-  await pause();
+const agentCanRun = driverName === 'browser-use' && cfg.browserUse.hide !== 'script';
+let llm: LlmConfig | null = null;
+if (agentCanRun) {
+  llm = cfg.browserUse.llm;
+  const problem = checkLlm(llm);
+  if (problem) die(`${problem}\n(or run with --hide script to never use an LLM)`);
 }
 
-console.log(`\nClassified ${classified}, marked ${hidden} as not interested. Log: ${args.log}`);
-await context.close();
+// ---------------------------------------------------------------- run
+
+const driver = await createDriver(driverName, cfg);
+
+// First Ctrl-C: finish the current post, then stop. Second: close the browser and quit.
+// Under `npm run`, one Ctrl-C arrives twice: the terminal signals the whole process group, and npm
+// forwards its own copy to us a few ms later. So a SIGINT within CTRL_C_ECHO_MS of the first is that
+// echo, not a second press.
+const CTRL_C_ECHO_MS = 1000;
+let stopRequestedAt: number | null = null;
+process.on('SIGINT', () => {
+  if (stopRequestedAt === null) {
+    stopRequestedAt = Date.now();
+    console.log('\nStopping after the current post (Ctrl-C again to quit now)...');
+    return;
+  }
+  if (Date.now() - stopRequestedAt < CTRL_C_ECHO_MS) return;
+  void driver.close().finally(() => process.exit(130));
+});
+
+console.log(
+  `driver: ${driverName}` +
+    (driverName === 'browser-use' ? `, hide: ${cfg.browserUse.hide}${llm ? `, llm: ${describe(llm)}` : ''}` : '') +
+    (dryRun ? ' (dry run)' : rehearse ? ' (rehearsal: nothing is clicked)' : ''),
+);
+
+try {
+  const result = await run(
+    {
+      driver,
+      classify: (post) =>
+        systemOne({
+          model: classifier.model,
+          questions: classifier.questions,
+          state: { author: post.author, text: post.text, quoted_post: post.quoted },
+        }),
+      shouldHide: (answers) => shouldHide(classifier, answers),
+      log: (d) => appendDecision(args.log, d),
+      onLine: (line) => console.log(line),
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      now: () => Date.now(),
+      shouldStop: () => stopRequestedAt !== null,
+    },
+    {
+      ...cfg.run,
+      dryRun,
+      rehearse,
+      classifierVersion: classifier.version,
+      hideMode: driverName === 'browser-use' ? cfg.browserUse.hide : null,
+      llm: llm ? describe(llm) : null,
+    },
+  );
+  const note = rehearse ? ' (rehearsal: nothing clicked)' : '';
+  console.log(`\nClassified ${result.classified}, marked ${result.hidden} as not interested${note}. Log: ${args.log}`);
+  if (result.stats) console.log(`Agent runs: ${result.stats.agentRuns}, LLM cost: $${result.stats.costUsd.toFixed(4)}`);
+  if (result.error) {
+    console.error(result.error);
+    process.exitCode = 1;
+  }
+} catch (err) {
+  console.error(`Error: ${(err as Error).message}`);
+  process.exitCode = 1;
+} finally {
+  await driver.close();
+}

@@ -1,5 +1,7 @@
 node_modules/
 .profile/
+.profile-bu/
+storage_state*.json
 .env
 .venv/
 __pycache__/

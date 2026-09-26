@@ -2,8 +2,9 @@
 
     uv run --env-file ../.env replay.py --classifier ../classifier.json --limit 100
 
-Writes a new log (same DecisionV1 format, dry_run=True) and prints how the new
-decisions differ from the original ones.
+Writes a new log (same DecisionV2 format, dry_run=True) and prints how the new
+decisions differ from the original ones. Each row keeps where the post was read
+(driver, hide_mode); everything about acting on it is reset, as in a dry run.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from decisions import (
     DEFAULT_CLASSIFIER,
     DEFAULT_LOG,
     ROOT,
-    DecisionV1,
+    DecisionV2,
     load_classifier,
     read_decisions,
     should_hide,
@@ -43,7 +44,7 @@ def main() -> None:
     out = args.out or ROOT / "data" / f"replay-{stamp}.jsonl"
     client = TypeSafeClient(model=classifier["model"])
 
-    def classify(original: DecisionV1) -> DecisionV1:
+    def classify(original: DecisionV2) -> DecisionV2:
         res = client.system_one(
             state={"author": original["author"], "text": original["text"], "quoted_post": original["quoted"]},
             questions=classifier["questions"],
@@ -58,6 +59,13 @@ def main() -> None:
             "hide": should_hide(classifier, answers),
             "acted": False,
             "dry_run": True,
+            # No browser, no agent: nothing was tried.
+            "rehearse": False,
+            "llm": None,
+            "via": None,
+            "fail_reason": None,
+            "menu_label": None,
+            "agent_cost_usd": None,
         }
 
     with ThreadPoolExecutor(args.workers) as pool:

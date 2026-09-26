@@ -1,0 +1,176 @@
+<!doctype html>
+<!--
+  A small interactive imitation of the X home feed, for driver tests. Serve it over http (any path;
+  tests use /home). Markup mimics the data-testids in bot/src/site/x.json. Query-string variants:
+    ?logged_out=1   no account switcher until you click "Log in" (simulates logging in by hand)
+    ?drift=1        the caret's data-testid is renamed (selector drift -> script path fails)
+    ?trap=1         no "Not interested" item: only Mute/Block/Report (agent must refuse)
+    ?lang=de        German menu labels (the script's English "not interested" text finds nothing)
+    ?shuffle=1      800 ms after load the feed re-renders in reverse order (stale-position hazard)
+    ?pages=N        how many pages of 6 posts infinite scroll can load (default 3)
+  window.__clicks records every menu-item click as {post, label}; window.__hidden lists hidden ids.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Home / X (fixture)</title>
+<style>
+  body { margin: 0; font: 15px system-ui, sans-serif; background: #fff; }
+  #nav { position: fixed; left: 0; top: 0; width: 200px; height: 100vh; border-right: 1px solid #eee; }
+  [data-testid="primaryColumn"] { margin-left: 220px; width: 600px; }
+  #header { position: sticky; top: 0; height: 53px; background: rgba(255,255,255,.95); border-bottom: 1px solid #eee; display: flex; z-index: 2; }
+  [role="tab"] { flex: 1; border: 0; background: none; font-weight: 600; }
+  [role="tab"][aria-selected="true"] { border-bottom: 3px solid #1d9bf0; }
+  article { padding: 12px; border-bottom: 1px solid #eee; min-height: 160px; position: relative; }
+  .actions { display: flex; gap: 8px; margin-top: 8px; }
+  [data-testid="caret"], [data-testid="caret-v2"] { position: absolute; right: 8px; top: 8px; }
+  div[role="link"] { border: 1px solid #ccc; border-radius: 12px; padding: 8px; margin-top: 8px; }
+  [role="menu"] { position: absolute; background: #fff; box-shadow: 0 0 12px #0003; z-index: 5; }
+  [role="menuitem"] { padding: 10px 16px; cursor: pointer; }
+  .notice { padding: 16px; color: #536471; }
+</style>
+</head>
+<body>
+<nav id="nav"><button id="login">Log in</button></nav>
+<main data-testid="primaryColumn"><div>
+  <div id="header">
+    <div role="tab" aria-selected="false">For you</div>
+    <div role="tab" aria-selected="true">Following</div>
+  </div>
+  <section id="feed"></section>
+</div></main>
+<script>
+const q = new URLSearchParams(location.search);
+const PAGES = Number(q.get('pages') || 3);
+const CARET = q.has('drift') ? 'caret-v2' : 'caret';
+window.__clicks = [];
+window.__hidden = [];
+let loadedPages = 0;
+let posts = [];
+
+function login() {
+  const nav = document.getElementById('nav');
+  nav.innerHTML = '<div data-testid="SideNav_AccountSwitcher_Button"><div dir="ltr"><span>Me</span></div>' +
+    '<div dir="ltr"><span>@Me</span></div></div>';
+}
+document.getElementById('login').onclick = login;
+if (!q.has('logged_out')) login();
+
+for (const tab of document.querySelectorAll('[role="tab"]')) {
+  tab.onclick = () => {
+    document.querySelectorAll('[role="tab"]').forEach((t) => t.setAttribute('aria-selected', String(t === tab)));
+  };
+}
+
+function makePost(i) {
+  const id = String(1000 + i);
+  const kind = i === 2 ? 'quote' : i === 3 ? 'ad' : i === 4 ? 'own' : i === 5 ? 'media' : 'plain';
+  const author = kind === 'own' ? 'Me' : ['alice', 'bob', 'carol', 'dave'][i % 4];
+  return { id, author, kind, text: kind === 'media' ? '' : `Post ${id} by ${author}: ${'lorem ipsum '.repeat(8)}` };
+}
+
+function menuFor(p) {
+  if (q.has('trap')) return [`Mute @${p.author}`, `Block @${p.author}`, 'Report post'];
+  if (q.get('lang') === 'de') {
+    return ['Nicht interessiert an diesem Beitrag', `@${p.author} folgen`, 'Beitrag einbetten',
+            'Diese Konversation stummschalten', 'Beitrag melden', `@${p.author} blockieren`];
+  }
+  if (p.kind === 'ad') return ['Why this ad?', 'Report ad'];
+  return ['Not interested in this post', `Follow @${p.author}`, `Add/remove @${p.author} from Lists`,
+          `Mute @${p.author}`, `Block @${p.author}`, 'Report post'];
+}
+
+function cellFor(p) {
+  const cell = document.createElement('div');
+  cell.setAttribute('data-testid', 'cellInnerDiv');
+  if (window.__hidden.includes(p.id)) {
+    cell.innerHTML = '<div class="notice">Thanks. You’ll see fewer posts like this. <button>Undo</button></div>';
+    return cell;
+  }
+  const quoted = p.kind === 'quote'
+    ? `<div role="link" tabindex="0"><a href="/zed/status/9${p.id}"><time datetime="2026-01-01">Jan 1</time></a>` +
+      `<div data-testid="tweetText">Quoted text from zed</div></div>` : '';
+  cell.innerHTML = `<article data-testid="tweet" tabindex="0">
+    <div data-testid="User-Name"><a href="/${p.author}">${p.author}</a>
+      <a href="/${p.author}/status/${p.id}"><time datetime="2026-01-02">Jan 2</time></a></div>
+    ${p.kind === 'ad' ? '<span>Ad</span>' : ''}
+    ${p.text ? `<div data-testid="tweetText">${p.text}</div>` : '<img alt="media" width="100" height="60">'}
+    ${quoted}
+    <button data-testid="${CARET}" aria-label="More" aria-haspopup="menu">⋯</button>
+    <div class="actions" role="group">
+      <button data-testid="reply" aria-label="Reply">↩</button>
+      <button data-testid="retweet" aria-label="Repost">↻</button>
+      <button data-testid="like" aria-label="Like">♡</button>
+      <button aria-label="Grok actions">G</button>
+      <button data-testid="bookmark" aria-label="Bookmark">B</button>
+      <button aria-label="Share post">S</button>
+    </div>
+  </article>`;
+  cell.querySelector(`[data-testid="${CARET}"]`).onclick = (e) => openMenu(p, e.currentTarget);
+  return cell;
+}
+
+// Full re-render (used by ?shuffle): every node is replaced, so stale element references break.
+function render() {
+  const feed = document.getElementById('feed');
+  feed.innerHTML = '';
+  for (const p of posts) feed.appendChild(cellFor(p));
+}
+
+// X swaps just the hidden post's cell for a notice.
+function hideCell(id) {
+  const article = [...document.querySelectorAll('article')].find((a) => a.querySelector(`a[href$="/status/${id}"]`));
+  const cell = article?.closest('[data-testid="cellInnerDiv"]');
+  if (cell) cell.innerHTML = cellFor(posts.find((p) => p.id === id)).innerHTML;   // same cell, new content
+}
+
+function closeMenu() { document.querySelector('[role="menu"]')?.remove(); }
+
+function openMenu(p, button) {
+  closeMenu();
+  const menu = document.createElement('div');
+  menu.setAttribute('role', 'menu');
+  const r = button.getBoundingClientRect();
+  menu.style.left = `${r.left + scrollX - 200}px`;
+  menu.style.top = `${r.bottom + scrollY}px`;
+  for (const label of menuFor(p)) {
+    const item = document.createElement('div');
+    item.setAttribute('role', 'menuitem');
+    item.innerHTML = `<span>${label}</span>`;
+    item.onclick = () => {
+      window.__clicks.push({ post: p.id, label });
+      closeMenu();
+      if (label.startsWith('Not interested') || label.startsWith('Nicht interessiert')) {
+        window.__hidden.push(p.id);
+        setTimeout(() => hideCell(p.id), 150);   // X swaps the post for a notice shortly after the click
+      }
+    };
+    menu.appendChild(item);
+  }
+  document.body.appendChild(menu);
+}
+
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenu(); });
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('[role="menu"]') && !e.target.closest('[aria-haspopup="menu"]')) closeMenu();
+});
+
+function loadPage() {
+  if (loadedPages >= PAGES) return;
+  const feed = document.getElementById('feed');
+  for (let i = loadedPages * 6; i < (loadedPages + 1) * 6; i++) {
+    const p = makePost(i);
+    posts.push(p);
+    feed.appendChild(cellFor(p));   // infinite scroll appends; existing nodes stay
+  }
+  loadedPages++;
+}
+addEventListener('scroll', () => {
+  if (innerHeight + scrollY >= document.body.scrollHeight - 400) loadPage();
+});
+
+loadPage();
+if (q.has('shuffle')) setTimeout(() => { posts.reverse(); render(); }, 800);
+</script>
+</body>
+</html>
