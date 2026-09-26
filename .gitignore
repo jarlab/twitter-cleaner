@@ -1,0 +1,4 @@
+node_modules/
+.profile/
+.env
+decisions.jsonl
